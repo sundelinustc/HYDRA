@@ -1,0 +1,1117 @@
+---
+title: "SDL_HYDRA_MDD"
+author: "Delin Sun"
+date: "4/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+```
+Statistical analyses of HYDRA outputs (by Delin Sun, Duke University, 04/16/2021)
+The whole pipeline of the HYDRA project:
+(1) Resting-state fMRI mean time series were extracted from 14 or 90 ROIs, which are in fact ICA-derived networks from FindLab.
+(2) R-to-Z transformed Pearson's Correlation Coefficients between the time series from each pair of ROIs were calculated as features.
+(3) All features (N=91 for 14 ROIs, and N=4005 for 90 ROIs) were harmonized to remove Site effects while keeping the information associated with bioogically relevant variables including disgnosis, age, and sex.
+(4) Features + raw label of diagnosis (-1=controls, 1=patients) as well as covariates (age, age^2, sex) were entered into HYDRA to remove the effects of covariates and then cluster the patients into subgroups. The output ARI value was used to select the optimal number of subgroups. The output new labels separated patients into subgroups.
+(5) This script aims to do the statistical analyses on HYDRA outputs to delineate their associations with demographic and clinical information.
+```
+
+
+```{r,include=FALSE}
+# packages
+library(tidyverse) # data manipulation and visualization
+library(lme4) # for linear mixed regression models
+library(lmerTest)# for p-value of lme4's models
+library(multcomp) # multiple comparisons
+library(emmeans) # pairwise-comparisons
+library(coin) # permutation test
+library(ggplot2)
+library(reshape2)
+library(ggsci)
+library(RColorBrewer) # for some extra colours in one of the graphs
+library(table1) # make Table 1, mainly demographic & clinical info
+library(sjPlot) # plot interactions of lm/lmer outputs
+library(ggpubr) # plot multiple panels
+library(forcats) # reorder the factors for plot
+library("xlsx")
+
+# library(ggpubr) # make easily publication ready plots
+# library(rstatix) # pipe-friendly R functions for easy statistical analyses
+
+# library(rayshader) # 2D plots to 3D plots
+```
+
+```{r,include=FALSE}
+# define ROIs
+  #roinames <- c("anterior_Salience","Auditory","Basal_Ganlia","dDMN","high_Visual","Language","LECN","post_Salience","Precuneus","prim_Visual","RECN","Sensorimotor","vDMN","Visuospatial")#14 ROIs
+  roinames <- c("aS01","aS02","aS03","aS04","aS05","aS06","aS07",
+                "Au01","Au02","Au03",
+                "BG01","BG02","BG03","BG04","BG05",
+                "dDMN01","dDMN02","dDMN03","dDMN04","dDMN05","dDMN06","dDMN07","dDMN08","dDMN09",
+                "hVis01","hVis02",
+                "Lan01","Lan02","Lan03","Lan04","Lan05","Lan06","Lan07",
+                "LECN01","LECN02","LECN03","LECN04","LECN05","LECN06",
+                "pS01","pS02","pS03","pS04","pS05","pS06","pS07","pS08","pS09","pS10","pS11","pS12",
+                "Pre01","Pre02","Pre03","Pre04",
+                "pVis01","pVis02",
+                "RECN01","RECN02","RECN03","RECN04","RECN05","RECN06",
+                "SM01","SM02","SM03","SM04","SM05","SM06",
+                "vDMN01","vDMN02","vDMN03","vDMN04","vDMN05","vDMN06","vDMN07","vDMN08","vDMN09","vDMN10",
+                "VS01","VS02","VS03","VS04","VS05","VS06","VS07","VS08","VS09","VS10","VS11")#90 ROIs
+#######################################################################
+# a function to plot heatmap for matrix of coefficients or p-values
+# Input
+# --- x, a vector, e.g. Pval0['Group',]
+# --- title, title of the coclor bar, e.g. 'P-val (FDR corr.)'
+# --- fmidpoint, mid point of the color bar, e.g. 0.05
+# --- flimit, min and max of the color bar, e.g. c(0,1)
+# --- roi, rois (part or all of the 90 regions) to show
+# Output
+# --- a heatmap representing the input matrix
+SDL_mheat <- function(x,title='Pearson Correlation',fmidpoint=0,flimit=c(-1,1),roi=NULL){
+    # corr. coef. matrix
+  n <- 90 # 14 or 90 ROIs from FindLab
+  m <- matrix(data=0, nrow=n, ncol=n)
+  m[lower.tri(m, diag=FALSE)] <- x
+  m <- t(m)
+  m[lower.tri(m, diag=FALSE)] <- x
+  
+  rownames(m) <- roinames
+  colnames(m) <- roinames
+
+  if (!is.null(roi)){m <- m[roi, roi]} # plot selected rois
+
+  # ggplot2 shows heatmap
+  mm <- melt(m)
+  # head(mm)
+  mm %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = fmidpoint, limit = flimit, space = "Lab", name=title) +theme_minimal()+ theme(axis.text.x =element_text(angle = 90, vjust = 1, size = 12, hjust = 1))+coord_fixed()
+}
+#######################################################################
+
+
+#######################################################################
+# a function to write the significant results into .xlsx file sheets
+# Input
+# --- Tval, a vector of T values, e.g. Tval0['Group',]
+# --- pval, a vector of p values, e.g. Pval0['Group',]
+# --- Thr, statistical threshold, e.g. 0.001
+# --- fname, file name
+# --- sheetName, excel sheet name
+# --- roi, rois (part or all of the 90 regions) to show
+# Output
+# --- a .xlsx file to store the significant results in designated sheet
+SDL_writeResults <- function(Tval,pval,Thr=0.05,fname,sheetName,roi=NULL){
+  n <- 90 # 14 or 90 ROIs from FindLab
+  mp <- matrix(data=999, nrow=n, ncol=n) # matrix to contain p-values
+  mT <- matrix(data=999, nrow=n, ncol=n) # matrix to contain T-values
+  mp[lower.tri(mp, diag=FALSE)] <- pval
+  mT[lower.tri(mT, diag=FALSE)] <- Tval
+  
+  rownames(mp) <- roinames
+  colnames(mp) <- roinames
+  rownames(mT) <- roinames
+  colnames(mT) <- roinames
+
+  if (!is.null(roi)){mp <- mp[roi, roi]} # investigate within the selected rois
+  if (!is.null(roi)){mT <- mT[roi, roi]} # investigate within the selected rois
+
+  mmp <- melt(mp) %>% filter(value<Thr) # only keep significant results
+  colnames(mmp) <- c('ROI1','ROI2','p_unc') # change the column names of variables
+  
+  mmT <- melt(mT) 
+  colnames(mmT) <- c('ROI1','ROI2','T') # change the column names of variables
+  
+  mmT <- mmT %>% merge(mmp,by=c("ROI1","ROI2"),all=TRUE) %>% na.omit() %>% .[order(.$T),] # merge T & p-val, and re-order the dataframe according to T-values (accending order)
+  
+  if (dim(mmp)[1]==0){
+    mmT <- 'No Significant Results'} # if there is no significant results, make a NaN entry
+  
+  write.xlsx(mmT, fname, sheetName=sheetName, col.names=TRUE, row.names=FALSE, append=TRUE)
+}
+##############################################################################
+
+
+
+
+##############################################################################
+### function for between-group comparisons (Wilcox test)
+# Input
+# --- col, dataframe column
+# --- df, dataframe
+# Output
+# --- p-value
+SDL_GrpComp <- function(col,df){
+  ind1 <- df$NewGroup=='MDD1'
+  ind2 <- df$NewGroup=='MDD2'
+  wilcox.test(col[ind1],col[ind2]) %>% .$p.value
+}
+##############################################################################
+
+
+
+
+
+#######################################################################
+# a function to model (lm or lmer) data for each ROI-to-ROI connection, and extract models/coefficients/p-values of models
+# Input
+# --- y, dataframe column, e.g. df$col01, or select(col1:col10)
+# --- df, dataframe
+# --- Otype, the type of outputs, e.g. "model", "coef", and "p"
+# --- ftxt, text for the formula, e.g. "lmer(formula = y ~ age_d + age_m + drinking_class + sex + race + ses + fh_alc_density + life_trauma_RP + (1|participant_id)"
+# --- fterms, which factor to be plotted
+# --- fxy, x and y labels
+# Output
+# --- model, list of models
+# --- coef,  matrix of coefficients
+# --- pval,  matrix of coefficients
+# --- plt,   list of plotting objects
+SDL_lm <- function(y,df,Otype,ftxt,fterms=NULL,fxy=NULL){
+  model <- eval(parse(text=paste(substr(ftxt,1,nchar(ftxt)-1),", data = df)")))
+  coef  <- model %>% summary() %>% coefficients() # Estimate, Std. Error, t value, Pr(>|t|)
+  tval  <- coef %>% .[,"t value"] 
+  pval  <- coef %>% .[,"Pr(>|t|)"]
+  #plt   <- model %>% plot_model(type = "pred", terms = fterms, title = "", axis.title = fxy)
+  switch(Otype,"model"=return(model),"coef"=return(list(coef)),"tval"=return(tval),"pval"=return(pval),"plt"=return(list(plt)))
+}
+##############################################################################
+```
+
+
+
+# Demographic and Clinical Info (Depression)
+```{r,echo=FALSE,warning=FALSE}
+# Load data & cov
+df0 <- read.csv("..\\Output\\FindLab90\\timeseries_MDD\\All_harmonized.csv",header=T,sep=",")
+
+# define factors
+df0$Sex      <- df0$Sex %>% as.factor() %>% plyr::revalue(c("2"="Female", "1"="Male"))
+df0$Group    <- df0$Group %>% as.factor() %>% plyr::revalue(c("-1"="Control", "1"="MDD"))
+df0$NewGroup <- df0$NewGroup %>% as.factor() %>% plyr::revalue(c("-1"="Control", "1"="MDD1","2"="MDD2","3"="MDD3","4"="MDD4"))
+df0          <- df0 %>% mutate(Group=fct_relevel(Group,"Control","MDD"), NewGroup=fct_relevel(NewGroup,"Control","MDD1","MDD2","MDD3","MDD4"),Sex=fct_relevel(Sex,"Male","Female")) # reorder the levels of each factor
+df0$Site <- df0$SITE %>% as.factor()
+
+```
+
+
+### Mean & SD per group (old labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+df %>% group_by(Group) %>% get_summary_stats(Age, type = "mean_sd")
+```
+
+### Number of subjects per group (old labels)
+```{r}
+df <- df0
+df %>% group_by(Group,Sex) %>% summarise(n=n())
+```
+
+### heatmap of the corr. coef. in a sample subject
+```{r}
+# df_data[1,2:92] %>% as.numeric() %>% SDL_mheat(title='Pearson\nCorr. Coef.', fmidpoint=0, flimit=c(-1,1))
+```
+
+### Age (Mean & SD) per group (new labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+dfx <- df %>% group_by(NewGroup) %>% get_summary_stats(Age, type = "mean_sd")
+dfx
+aov(Age ~ NewGroup, data = df) %>% summary()
+aov(Age ~ NewGroup, data = df) %>% emmeans("NewGroup") %>% pwpm()
+aov(Age ~ NewGroup, data = df) %>% glht(linfct=mcp("NewGroup"="Tukey")) %>% summary()
+
+independence_test(Age ~ NewGroup, data=df) # permutation test
+```
+
+### Number of subjects per group (new labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+dfx <- df %>% group_by(NewGroup,Sex) %>% summarise(n=n())
+dfx
+dfx$n %>% matrix(2,5) %>% chisq.test()
+```
+
+### Number of subjects, group_by(NewGroup,Site)
+```{r}
+df <- df0
+df1 <- df %>% group_by(NewGroup,Site) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=NewGroup, y=n, x=Site, label=n)) + geom_bar(position="stack", stat="identity") +ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+m <- df1$n %>% matrix(5,5) %>% t() # row 1,2&3 = Control, PAT1, & PAT2
+m <- m[2:5,] # patient subgroups
+m
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+
+m1 <- m/t(replicate(4,colSums(m)))
+m1
+m1 %>% chisq.test() # test on ratio data
+```
+
+### Age, group_by(NewGroup,Site)
+```{r}
+df <- df0
+df %>% group_by(NewGroup,Site) %>% get_summary_stats(Age, type = "mean_sd")
+df %>% ggplot(aes(x=Site, y=Age, fill=NewGroup)) + geom_boxplot() + xlab("Site") + ylab("Age (Years)")
+aov(Age ~ SITE * NewGroup, data = df) %>% summary()
+```
+
+### Current MDD severity, group_by(NewGroup,Site)
+```{r}
+# dfx$CurrentMDDSeverity <- dfx$Current.MDD.severity %>% as.numeric()
+# dfx %>% group_by(NewGroup,SITE) %>% get_summary_stats(CurrentMDDSeverity, type = "mean_sd")
+# dfx %>% ggplot(aes(x=SITE, y=CurrentMDDSeverity, fill=NewGroup)) + geom_boxplot() + xlab("Site") + ylab("Current MDD Severity")
+```
+
+
+### Recur, group_by(NewGroup,Recur)
+```{r}
+df <- df0
+df <- df[complete.cases(df$Recur),] # remove rows with NaN
+df$Recur <- df$Recur %>% as.factor()
+df %>% group_by(NewGroup,Recur) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,Recur) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=Recur, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+
+ng <- length(df1$NewGroup) # number of patient subgroups x number of Recur levels (1 & 2)
+m <- df1$n[2:ng] %>% matrix(2,ng/2) %>% t() # row 2&3 = PAT1, & PAT2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+
+```
+
+
+### AD, group_by(NewGroup,AD)
+```{r}
+df <- df0[complete.cases(df0$AD),] # remove rows with NaN
+df$AD <- df$AD %>% as.factor()
+df %>% group_by(NewGroup,AD) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,AD) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=AD, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+
+ng <- length(df1$NewGroup) # number of patient subgroups x number of Recur levels (1 & 2)
+m <- df1$n[2:ng] %>% matrix(2,ng/2) %>% t() # row 2&3 = PAT1, & PAT2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+```
+
+### Rem, group_by(NewGroup,Rem)
+```{r}
+df <- df0[complete.cases(df0$Rem),] # remove rows with NaN
+df$Rem <- df$Rem %>% as.factor()
+df %>% group_by(NewGroup,Rem) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,Rem) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=Rem, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+
+ng <- length(df1$NewGroup) # number of patient subgroups x number of Recur levels (1 & 2)
+m <- df1$n[2:ng] %>% matrix(2,ng/2) %>% t() # row 2&3 = PAT1, & PAT2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+```
+
+### AO, group_by(NewGroup)
+```{r}
+df <- df0[complete.cases(df0$AO),] # remove rows with NaN
+df1 <- df %>% group_by(NewGroup) %>% get_summary_stats(AO, type = "mean_sd")
+df %>% ggplot(aes(x=NewGroup, y=AO, fill=NewGroup)) + geom_boxplot() + xlab("NewGroup") + ylab("AO")
+
+aov(AO ~ NewGroup, data = df) %>% emmeans("NewGroup") %>% pwpm()
+```
+
+### Sev, group_by(NewGroup,Sev)
+```{r}
+df <- df0[complete.cases(df0$Sev),] # remove rows with NaN
+
+df$Sev <- df$Sev %>% as.factor()
+df1 <- df %>% group_by(NewGroup,Sev) %>% summarise(n=n())
+df1
+
+
+df1 %>% ggplot(aes(fill=Sev, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+
+df1 <- df1 %>% ungroup() %>%  add_row(NewGroup="MDD1",Sev=as.factor(1),n=0,.before=1) # add a row
+df1 <- df1 %>% ungroup() %>%  add_row(NewGroup="MDD4",Sev=as.factor(1),n=0,.before=10) # add a row
+
+ng <- length(df1$NewGroup) # number of patient subgroups x number of Recur levels (1 & 2)
+m <- df1$n %>% matrix(3,ng/3) %>% t() # row 2&3 = PAT1, & PAT2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+```
+
+### YODA_SAD__NESDA_Harmonized_symptoms
+```{r,echo=FALSE}
+# load data
+df1 <- read.csv("..\\Output\\FindLab90\\timeseries_MDD\\YODA_SAD__NESDA_Harmonized_symptoms.csv",header=T,sep=",",skip=2) # skip the first 2 rows
+df1$fID1 <- sub(".*_", "", df1$SbjID)
+df1$fID <- paste('sub',df1$fID1,sep='-') # add the column of fID to merge
+df <- df0 %>% merge(df1,by="fID",all=FALSE)
+df <- df %>% subset(select=-c(X, X.1, X.2)) # remove the columns of no interest
+
+df1 <- df %>% dplyr::select(fID:StudyName,SbjID:Harmonized_Total)
+write.csv(df1, "..\\Output\\FindLab90\\timeseries_MDD\\YODA_SAD__NESDA_Harmonized_symptoms1.csv", col.names=TRUE, row.names=FALSE)
+
+df <- df[df$NewGroup!="Control",] # only comparing among subgroups
+
+# Pairwise comparisons between groups
+vlist <- df %>% dplyr::select(falling.asleep:Harmonized_Total) %>% colnames() # the list of variables to compare
+for (var in vlist){
+  cat(paste('\n*******\nVariable = ',var,'\n',sep="")) # print the title
+  df$y <- df[,var] # make variable y to input into lm model
+  dfx <- NULL
+  dfx <- lm(y ~ NewGroup + Age + Sex, data=df) %>% emmeans("NewGroup") %>% pwpm()
+  print(dfx)
+  dfx <- aov(y ~ NewGroup + Age + Sex, data = df) %>% glht(linfct=mcp("NewGroup"="Tukey")) %>% summary()
+  print(dfx) # print the results, diagonal=mean, upper-triangle=p-values, lower-triangle=mean differences
+}
+
+
+
+# Tval <- df %>% select(falling.asleep:Harmonized_Total) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ NewGroup + Age + Sex)") %>% as.data.frame()
+# 
+# Pval <- df %>% select(falling.asleep:Harmonized_Total) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ NewGroup + Age + Sex)")  %>% as.data.frame() 
+# Pval1 <- Pval[c("NewGroupMDD2","NewGroupMDD3","NewGroupMDD4"),] # only see these factors
+# as.matrix((Pval1 < 0.05) + 0) # 1:p<0.05, 0:p>=0.05
+
+# plots
+df %>% ggplot(aes(x=NewGroup, y=MADRS2, fill=NewGroup)) + geom_boxplot() + ylab("MADRS2")
+df %>% ggplot(aes(x=NewGroup, y=MADRS6, fill=NewGroup)) + geom_boxplot() + ylab("MADRS6")
+df %>% ggplot(aes(x=NewGroup, y=MADRS10, fill=NewGroup)) + geom_boxplot() + ylab("MADRS10")
+df %>% ggplot(aes(x=NewGroup, y=MADRS_Total, fill=NewGroup)) + geom_boxplot() + ylab("MADRS_total")
+
+# dfx <- df[complete.cases(df$eating.more),] # remove rows with NaN
+# dfx$eating.more <- dfx$eating.more %>% as.factor()
+# dfx <- dfx %>% group_by(NewGroup,eating.more) %>% summarise(n=n())
+# dfx %>% ggplot(aes(fill=eating.more, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+# 
+# # plots --eating.more
+# df %>% ggplot(aes(x=NewGroup, y=eating.more, fill=NewGroup)) + geom_violin() + xlab("NewGroup") + ylab("Eating More")
+# 
+# dfx <- df[complete.cases(df$eating.more),] # remove rows with NaN
+# dfx$eating.more <- dfx$eating.more %>% as.factor()
+# dfx <- dfx %>% group_by(NewGroup,eating.more) %>% summarise(n=n())
+# dfx %>% ggplot(aes(fill=eating.more, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+# 
+# # plots --weight.gain
+ df %>% ggplot(aes(x=NewGroup, y=weight.gain, fill=NewGroup)) + geom_boxplot() + xlab("NewGroup") + ylab("Weight Gain")
+# 
+# dfx <- df[complete.cases(df$weight.gain),] # remove rows with NaN
+# dfx$weight.gain <- dfx$weight.gain %>% as.factor()
+# dfx <- dfx %>% group_by(NewGroup,weight.gain) %>% summarise(n=n())
+# dfx %>% ggplot(aes(fill=weight.gain, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+
+```
+
+
+
+
+
+
+
+### Harmonized_symptoms of depression
+```{r,echo=FALSE}
+# load data
+df1 <- read.csv("..\\Origins\\MDD\\YODA_SAD__NESDA_Harmonized_symptoms.csv",header=T,sep=",")
+df1$SubjID <- sub('.*_','',df1$SubjID) # get the ID after "_"
+df1$fID <- paste('sub',df1$SubjID,sep='-') # concatenate "sub" and ID using "-"
+df1 <- df0 %>% merge(df1,by="fID",all=FALSE)
+
+col <- df1 %>% select(Harmonized_Total)
+ind1 <- df1$NewGroup=='MDD1'
+ind2 <- df1$NewGroup=='MDD2'
+t.test(col[ind1,],col[ind2,])
+
+### function for between-group comparisons (Wilcox test)
+# Input
+# --- col, dataframe column
+# --- df, dataframe
+# Output
+# --- p-value
+SDL_GrpComp <- function(col,df){
+  ind1 <- df$NewGroup=='MDD1'
+  ind2 <- df$NewGroup=='MDD2'
+  wilcox.test(col[ind1],col[ind2]) %>% .$p.value
+}
+
+# between-group comparison
+dfx <- df1 %>% select(Harmonized_Total) %>% sapply(SDL_GrpComp,df=df1)
+
+df1 %>% group_by(NewGroup) %>% get_summary_stats(Harmonized_Total, type = "mean_sd")
+df1 %>% ggplot(aes(x=NewGroup, y=Harmonized_Total, fill=NewGroup)) + geom_boxplot() + xlab("NewGroup") + ylab("Harmonized MDD Symptom Severity")
+
+# Association between FC & clinical measures
+## Effects of Harmonized_Total (harmonized depression symptom severity)
+### NewGroup * MDD1
+df <- df1 %>% filter(NewGroup=='MDD1' | NewGroup=='MDD2')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)")
+x <- Tval['NewGroupMDD2:Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['NewGroupMDD2:Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+
+df %>% ggplot(aes(x = Harmonized_Total, y = V39, col = as.factor(NewGroup))) + geom_point(size = 1, alpha = .99) + geom_smooth(method = lm, formula = y ~ x, se = T, size = 1.5, linetype = 1, alpha = .4) + theme_minimal() + labs(x="Harmonized MDD Symptom Severity",y="rsFC", title = "LECN -to- dDMN", subtitle = "") + scale_color_manual(name ="", labels = c("MDD1", "MDD2"), values = c("pink", "lightblue"))
+
+### MDD1
+df <- df1 %>% filter(NewGroup=='MDD1')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")
+x <- Tval['Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+cor.test(df$Harmonized_Total,df$V63)
+
+### MDD2
+df <- df1 %>% filter(NewGroup=='MDD2')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")
+x <- Tval['Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+cor.test(df$Harmonized_Total,df$V63)
+
+```
+
+
+### AO of depression
+```{r,echo=FALSE}
+# load data
+df1 <- df0[complete.cases(df0$AO),] # remove rows with NaN
+
+### function for between-group comparisons (Wilcox test)
+# Input
+# --- col, dataframe column
+# --- df, dataframe
+# Output
+# --- p-value
+SDL_GrpComp <- function(col,df){
+  ind1 <- df$NewGroup=='MDD1'
+  ind2 <- df$NewGroup=='MDD2'
+  wilcox.test(col[ind1],col[ind2]) %>% .$p.value
+}
+
+# between-group comparison
+dfx <- df1 %>% select(AO) %>% sapply(SDL_GrpComp,df=df1)
+
+df1 %>% group_by(NewGroup) %>% get_summary_stats(Harmonized_Total, type = "mean_sd")
+df1 %>% ggplot(aes(x=NewGroup, y=Harmonized_Total, fill=NewGroup)) + geom_boxplot() + xlab("NewGroup") + ylab("Harmonized MDD Symptom Severity")
+
+# Association between FC & clinical measures
+## Effects of Harmonized_Total (harmonized depression symptom severity)
+### NewGroup * MDD1
+df <- df1 %>% filter(NewGroup=='MDD1' | NewGroup=='MDD2')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)")
+x <- Tval['NewGroupMDD2:Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['NewGroupMDD2:Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+
+df %>% ggplot(aes(x = Harmonized_Total, y = V39, col = as.factor(NewGroup))) + geom_point(size = 1, alpha = .99) + geom_smooth(method = lm, formula = y ~ x, se = T, size = 1.5, linetype = 1, alpha = .4) + theme_minimal() + labs(x="Harmonized MDD Symptom Severity",y="rsFC", title = "LECN -to- dDMN", subtitle = "") + scale_color_manual(name ="", labels = c("MDD1", "MDD2"), values = c("pink", "lightblue"))
+
+### MDD1
+df <- df1 %>% filter(NewGroup=='MDD1')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")
+x <- Tval['Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+cor.test(df$Harmonized_Total,df$V63)
+
+### MDD2
+df <- df1 %>% filter(NewGroup=='MDD2')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")
+x <- Tval['Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonized_Total + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+cor.test(df$Harmonized_Total,df$V63)
+
+```
+
+
+
+# Between-group comparisons
+```{r,echo=FALSE}
+# rois of interest
+## anterior/posterior Salience networks, ventral/dorsal default mode networks, left/right executive control networks
+roi <- c("aS01","aS02","aS03","aS04","aS05","aS06","aS07",
+         "pS01","pS02","pS03","pS04","pS05","pS06","pS07","pS08","pS09","pS10","pS11","pS12",          "vDMN01","vDMN02","vDMN03","vDMN04","vDMN05","vDMN06","vDMN07","vDMN08","vDMN09","vDMN10",
+         "dDMN01","dDMN02","dDMN03","dDMN04","dDMN05","dDMN06","dDMN07","dDMN08","dDMN09",
+         "LECN01","LECN02","LECN03","LECN04","LECN05","LECN06",
+         "RECN01","RECN02","RECN03","RECN04","RECN05","RECN06")
+
+fname_results = "..\\Output\\FindLab90\\timeseries_MDD\\Table_Between_Group_Comp.xlsx"
+unlink(fname_results) # remove the file at first hand to avoid conflicts
+
+# raw, MDD vs Control
+df <- df0
+# patients vs. control
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,30),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD',],Pval0['GroupMDD',],0.001,fname=fname_results,sheetName="MDD_vs_Control",roi=roi)
+
+# New, MDD1 vs Control
+df <- df0 %>% filter(NewGroup=="MDD1" | NewGroup=="Control") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD1',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD1',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,30),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD1',],Pval0['GroupMDD1',],0.001,fname=fname_results,sheetName="MDD1_vs_Control",roi=roi)
+
+# New, MDD2 vs Control
+df <- df0 %>% filter(NewGroup=="MDD2" | NewGroup=="Control") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD2',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,30),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD2',],Pval0['GroupMDD2',],0.001,fname=fname_results,sheetName="MDD2_vs_Control",roi=roi)
+
+# New, MDD3 vs Control
+df <- df0 %>% filter(NewGroup=="MDD3" | NewGroup=="Control") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD3',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD3',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,30),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD3',],Pval0['GroupMDD3',],0.001,fname=fname_results,sheetName="MDD3_vs_Control",roi=roi)
+
+# New, MDD4 vs Control
+df <- df0 %>% filter(NewGroup=="MDD4" | NewGroup=="Control") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD4',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD4',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,30),roi=roi)
+
+
+SDL_writeResults(Tval0['GroupMDD4',],Pval0['GroupMDD4',],0.001,fname=fname_results,sheetName="MDD4_vs_Control",roi=roi)
+
+
+
+
+
+
+
+# New, MDD2 vs MDD1
+df <- df0 %>% filter(NewGroup=="MDD1" | NewGroup=="MDD2") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD2',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD2',],Pval0['GroupMDD2',],0.001,fname=fname_results,sheetName="MDD2_vs_MDD1",roi=roi)
+
+
+# New, MDD3 vs MDD1
+df <- df0 %>% filter(NewGroup=="MDD1" | NewGroup=="MDD3") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD3',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% dplyr::select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD3',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD3',],Pval0['GroupMDD3',],0.001,fname=fname_results,sheetName="MDD3_vs_MDD1",roi=roi)
+
+x <- Pval0['GroupMDD3',]
+x[x<0.001] # V3568 shows the min p-value for GroupMDD3
+
+# plot the effects of Group in a sample connection
+y <- df[,"V2447"]
+mod <- lm(formula = y ~ Group + Sex + Age, data=df)
+mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group"), title = "vDMN -to- LECN FC",axis.title=c("","rsFC")) # example plot of Group effect
+
+df %>% ggplot(aes(x=NewGroup, y=V2447, fill=NewGroup)) + geom_boxplot() + labs(title="vDMN -to- dDMN FC",y="rsFC") 
+
+# New, MDD4 vs MDD1
+df <- df0 %>% filter(NewGroup=="MDD1" | NewGroup=="MDD4") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD4',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD4',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD4',],Pval0['GroupMDD4',],0.001,fname=fname_results,sheetName="MDD4_vs_MDD1",roi=roi)
+
+# New, MDD3 vs MDD2
+df <- df0 %>% filter(NewGroup=="MDD2" | NewGroup=="MDD3") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD3',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD3',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD3',],Pval0['GroupMDD3',],0.001,fname=fname_results,sheetName="MDD3_vs_MDD2",roi=roi)
+
+
+# New, MDD4 vs MDD2
+df <- df0 %>% filter(NewGroup=="MDD2" | NewGroup=="MDD4") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD4',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD4',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD4',],Pval0['GroupMDD4',],0.001,fname=fname_results,sheetName="MDD4_vs_MDD2",roi=roi)
+
+# New, MDD4 vs MDD3
+df <- df0 %>% filter(NewGroup=="MDD3" | NewGroup=="MDD4") %>% mutate(Group=NewGroup)
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD4',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+
+Pval0 <- df %>% dplyr::select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)") 
+x <- -1* log10(Pval0['GroupMDD4',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(min(x),max(x)),roi=roi)
+
+SDL_writeResults(Tval0['GroupMDD4',],Pval0['GroupMDD4',],0.001,fname=fname_results,sheetName="MDD4_vs_MDD3",roi=roi)
+
+x <- Pval0['GroupMDD4',]
+x[x<0.001] # V3568 shows the min p-value for GroupMDD4
+
+# plot the effects of Group in a sample connection
+y <- df[,"V3568"]
+mod <- lm(formula = y ~ Group + Sex + Age, data=df)
+mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group"), title = "vDMN -to- dDMN FC",axis.title=c("","rsFC")) # example plot of Group:Sex effect
+
+df %>% ggplot(aes(x=NewGroup, y=V3568, fill=NewGroup)) + geom_boxplot() + labs(title="vDMN -to- dDMN FC",y="rsFC") 
+```
+
+# FC & clinical associations
+```{r,echo=FALSE}
+## Effects of Harmonized_Total (harmonized depression symptom severity)
+# load data
+df1 <- read.csv("..\\Output\\FindLab90\\timeseries_MDD\\YODA_SAD__NESDA_Harmonized_symptoms.csv",header=T,sep=",",skip=2) # skip the first 2 rows
+df1$fID1 <- sub(".*_", "", df1$SbjID)
+df1$fID <- paste('sub',df1$fID1,sep='-') # add the column of fID to merge
+df <- df0 %>% merge(df1,by="fID",all=FALSE)
+df <- df %>% subset(select=-c(X, X.1, X.2)) # remove the columns of no interest
+df <- df[df$NewGroup!="Control",] # only comparing among subgroups
+
+
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)") 
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ NewGroup*Harmonized_Total + Age + Sex)")
+
+x <- Tval['NewGroupMDD2:Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+x <- -1* log10(Pval['NewGroupMDD2:Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,5),roi=roi)
+
+x <- Tval['NewGroupMDD3:Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+x <- -1* log10(Pval['NewGroupMDD3:Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,5),roi=roi)
+
+x <- Tval['NewGroupMDD4:Harmonized_Total',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)), roi=roi)
+x <- -1* log10(Pval['NewGroupMDD4:Harmonized_Total',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.001), flimit=c(0,5),roi=roi)
+
+
+df %>% ggplot(aes(x = Harmonized_Total, y = V24, col = NewGroup)) + geom_point(size = 1, alpha = .59) + geom_smooth(method = lm, formula = y ~ x, se = T, size = 1.5, linetype = 1, alpha = .4) + theme_minimal() + labs(x="Harmonized MDD Symptom Severity",y="rsFC", title = "aSalience -to- vDMN")# + scale_color_manual(name ="", values = c("pink", "lightblue"))
+
+```
+
+
+
+
+## Raw group labels 
+```{r,echo=FALSE}
+NameGroupEffect <- 'GroupMDD'
+NameGroupAge    <- 'GroupMDD:Age'
+NameGroupSex    <- 'GroupMDD:SexFemale'
+
+df <- df0
+# patients vs. control
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0[NameGroupEffect,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupEffect,])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0[NameGroupAge,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupAge,])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup, shape=Site)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0[NameGroupSex,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupSex,])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+# New groups: (MDD1 + Controls) 
+```{r,echo=FALSE}
+# MDD1 vs. controls
+df <- df0 %>% filter(NewGroup!="MDD2") # only groups -1 & 1
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of MDD2
+# df %>% SDL_mplt()
+
+# MDD vs. control
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD1',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD1',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupMDD1:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD1:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupMDD1:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD1:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LCEN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LCEN-to-Language FC")
+```
+
+
+
+## New groups: (MDD2 + Controls)
+```{r,echo=FALSE}
+# MDD2 vs. controls
+df <- df0 %>% filter(NewGroup!="MDD1") # only groups -1 & 2
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of MDD1
+# df %>% SDL_mplt()
+
+# MDD vs. control
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupMDD2:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupMDD2:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+## New groups: (MDD1 + MDD2)
+```{r,echo=FALSE}
+# MDD1 vs. MDD2
+df <- df0 %>% filter(NewGroup!="Control") 
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of Control
+# df %>% SDL_mplt()
+
+# MDD2 vs. MDD1
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupMDD2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupMDD2:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupMDD2:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupMDD2:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+### Harmonized_symptoms of post-traumatic stress disorder
+```{r,echo=FALSE}
+# load data
+df1 <- read.csv("..\\Output\\FindLab90\\timeseries_MDD\\MDD_Datasets_5Sites_Harmonized.csv",header=T,sep=",")
+df1 <- df0 %>% merge(df1,by="fID",all=FALSE)
+
+col <- df1 %>% select(Harmonize_MDD)
+ind1 <- df1$NewGroup=='MDD1'
+ind2 <- df1$NewGroup=='MDD2'
+t.test(col[ind1,],col[ind2,])
+
+### function for between-group comparisons (Wilcox test)
+# Input
+# --- col, dataframe column
+# --- df, dataframe
+# Output
+# --- p-value
+SDL_GrpComp <- function(col,df){
+  ind1 <- df$NewGroup=='MDD1'
+  ind2 <- df$NewGroup=='MDD2'
+  wilcox.test(col[ind1],col[ind2]) %>% .$p.value
+}
+
+# between-group comparison
+dfx <- df1 %>% select(Harmonize_MDD) %>% sapply(SDL_GrpComp,df=df1)
+
+df1 %>% group_by(NewGroup) %>% get_summary_stats(Harmonize_MDD, type = "mean_sd")
+df1 %>% ggplot(aes(x=NewGroup, y=Harmonize_MDD, fill=NewGroup)) + geom_boxplot() + xlab("NewGroup") + ylab("Harmonized MDD Symptom Severity")
+
+# Association between FC & clinical measures
+## Effects of Harmonize_MDD (current MDD symptom severity)
+### NewGroup * MDD1
+df <- df1 %>% filter(NewGroup=='MDD1' | NewGroup=='MDD2')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ NewGroup*Harmonize_MDD + Age + Sex)")
+x <- Tval['NewGroupMDD2:Harmonize_MDD',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ NewGroup*Harmonize_MDD + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['NewGroupMDD2:Harmonize_MDD',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+
+df %>% ggplot(aes(x = Harmonize_MDD, y = V63, col = as.factor(NewGroup))) + geom_point(size = 1, alpha = .99) + geom_smooth(method = lm, formula = y ~ x, se = T, size = 1.5, linetype = 1, alpha = .4) + theme_minimal() + labs(x="MDD Symptom Severity",y="rsFC", title = "Visual Spatial -to- Language", subtitle = "") + scale_color_manual(name ="", labels = c("MDD1", "MDD2"), values = c("pink", "lightblue"))
+
+### MDD1
+df <- df1 %>% filter(NewGroup=='MDD1')
+Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonize_MDD + Age + Sex)")
+x <- Tval['Harmonize_MDD',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+
+Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonize_MDD + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval['Harmonize_MDD',])
+SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+cor.test(df$Harmonize_MDD,df$V63)
+
+# ### MDD2
+# df <- df1 %>% filter(NewGroup=='MDD2')
+# Tval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Harmonize_MDD + Age + Sex)")
+# x <- Tval['Harmonize_MDD',]
+# SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(-2,2))
+# 
+# Pval <- df %>% select(V1:V4005) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Harmonize_MDD + Age + Sex)")  %>% t() %>% as.data.frame() %>% t()#sapply(p.adjust,method="fdr") %>% t()
+# x <- -1* log10(Pval['Harmonize_MDD',])
+# SDL_mheat(x=x, title='-1*log10(P_unc)', fmidpoint=-1*log10(0.05), flimit=c(0,2))
+# cor.test(df$Harmonize_MDD,df$V63)
+
+```

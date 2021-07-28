@@ -1,0 +1,585 @@
+---
+title: "SDL_HYDRA_All"
+author: "Delin Sun"
+date: "4/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+```
+Statistical analyses of HYDRA outputs (by Delin Sun, Duke University, 04/16/2021)
+The whole pipeline of the HYDRA project:
+(1) Resting-state fMRI mean time series were extracted from 14 ROIs, which are in fact ICA-derived networks from FindLab.
+(2) R-to-Z transformed Pearson's Correlation Coefficients between the time series from each pair of ROIs were calculated as features.
+(3) All features (N=91) were harmonized to remove Site effects while keeping the information associated with bioogically relevant variables including disgnosis, age, and sex.
+(4) Features + raw label of diagnosis (-1=controls, 1=patients) as well as covariates (age, age^2, sex) were entered into HYDRA to remove the effects of covariates and then cluster the patients into subgroups. The output ARI value was used to select the optimal number of subgroups. The output new labels separated patients into subgroups.
+(5) This script aims to do the statistical analyses on HYDRA outputs to delineate their associations with demographic and clinical information.
+```
+
+
+```{r,include=FALSE}
+# packages
+library(tidyverse) # data manipulation and visualization
+library(lme4) # for linear mixed regression models
+library(lmerTest)# for p-value of lme4's models
+library(ggplot2)
+library(reshape2)
+library(ggsci)
+library(RColorBrewer) # for some extra colours in one of the graphs
+library(table1) # make Table 1, mainly demographic & clinical info
+library(sjPlot) # plot interactions of lm/lmer outputs
+library(ggpubr) # plot multiple panels
+library(forcats) # reorder the factors for plot
+
+# library(ggpubr) # make easily publication ready plots
+# library(rstatix) # pipe-friendly R functions for easy statistical analyses
+
+# library(rayshader) # 2D plots to 3D plots
+```
+
+```{r,include=FALSE}
+#######################################################################
+# a function to plot heatmap for matrix of coefficients or p-values
+# Input
+# --- x, a vector, e.g. Pval0['Group',]
+# --- title, title of the coclor bar, e.g. 'P-val (FDR corr.)'
+# --- fmidpoint, mid point of the color bar, e.g. 0.05
+# --- flimit, min and max of the color bar, e.g. c(0,1)
+# Output
+# --- a heatmap representing the input matrix
+SDL_mheat <- function(x,title='Pearson Correlation',fmidpoint=0,flimit=c(-1,1)){
+  # corr. coef. matrix
+  n <- 14 # 14 ROIs from FindLab
+  m <- matrix(data=0, nrow=n, ncol=n)
+  m[lower.tri(m, diag=FALSE)] <- x
+  m <- t(m)
+  m[lower.tri(m, diag=FALSE)] <- x
+  
+  roinames <- c("anterior_Salience","Auditory","Basal_Ganlia","dDMN","high_Visual","Language","LECN","post_Salience","Precuneus","prim_Visual","RECN","Sensorimotor","vDMN","Visuospatial")
+  rownames(m) <- roinames
+  colnames(m) <- roinames
+
+  # ggplot2 shows heatmap
+  mm <- melt(m)
+  # head(mm)
+  mm %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = fmidpoint, limit = flimit, space = "Lab", name=title) +theme_minimal()+ theme(axis.text.x =element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()
+}
+##############################################################################
+```
+
+
+# Demographic and Clinical Info
+```{r,echo=FALSE}
+df0 <- read.csv("..\\Output\\timeseries_MDDPTSD\\All_harmonized.csv",header=T,sep=",")
+
+# define factors
+df0$Sex      <- df0$Sex %>% as.factor() %>% plyr::revalue(c("2"="Female", "1"="Male"))
+
+df0$Group    <- df0$Group %>% as.factor() %>% plyr::revalue(c("-1"="Control","1"="MDD","2"="PTSD"))
+
+df0$NewGroup <- df0$NewGroup %>% as.factor() %>% plyr::revalue(c("-1"="Control", "1"="PAT1","2"="PAT2"))
+
+df0$NewGroup4 <- df0$NewGroup4 %>% as.factor() %>% plyr::revalue(c("-1"="Control", "1"="MDD1","2"="MDD2","3"="PTSD1","4"="PTSD2"))
+
+df0          <- df0 %>% mutate(Group=fct_relevel(Group,"Control","PTSD"),NewGroup=fct_relevel(NewGroup,"Control","PAT1","PAT2"),NewGroup4=fct_relevel(NewGroup4,"Control","MDD1","MDD2","PTSD1","PTSD2"),Sex=fct_relevel(Sex,"Male","Female")) # reorder the levels of each factor
+
+df0$Site <- df0$SITE %>% as.factor()
+```
+
+
+
+### Mean & SD per group (old labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+df %>% group_by(Group) %>% get_summary_stats(Age, type = "mean_sd")
+```
+
+### Number of subjects per group (old labels)
+```{r}
+df <- df0
+df %>% group_by(Group,Sex) %>% summarise(n=n())
+```
+
+### heatmap of the corr. coef. in a sample subject
+```{r}
+# df_data[1,2:92] %>% as.numeric() %>% SDL_mheat(title='Pearson\nCorr. Coef.', fmidpoint=0, flimit=c(-1,1))
+```
+
+### Nean & SD per group (new labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+dfx <- df %>% group_by(NewGroup) %>% get_summary_stats(Age, type = "mean_sd")
+dfx
+aov(Age ~ NewGroup, data = df) %>% summary()
+```
+
+### Number of subjects per group (new labels)
+```{r}
+df <- df0 # just to keep df0 untouched
+dfx <- df %>% group_by(NewGroup,Sex) %>% summarise(n=n())
+dfx
+dfx$n %>% matrix(2,3) %>% chisq.test()
+```
+
+### Number of subjects, group_by(NewGroup,Site)
+```{r}
+df <- df0
+df1 <- df %>% group_by(NewGroup,Site) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=NewGroup, y=n, x=Site, label=n)) + geom_bar(position="stack", stat="identity") +ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+m <- matrix(df1$n,5,3) %>% t() # Control, PAT1, & PAT2
+m <- m[2:3,] # PTSD1 & PTSD2, or PTSD1 & PTSD2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+
+```
+
+### Number of subjects, group_by(NewGroup,Datasets)
+```{r}
+df <- df0
+df$Datasets <- df0$SITE %>% as.factor() %>% plyr::revalue(c("1"="MDDSite", "2"="MDDSite","3"="MDDSite", "4"="MDDSite","5"="MDDSite", "6"="PTSDSite","7"="PTSDSite","8"="PTSDSite","9"="PTSDSite","10"="PTSDSite"))
+df1 <- df %>% group_by(NewGroup,Datasets) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=NewGroup, y=n, x=Datasets, label=n)) + geom_bar(position="stack", stat="identity") +ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+m <- matrix(df1$n,2,3) %>% t() # Control, PAT1, & PAT2
+m <- m[2:3,] # PTSD1 & PTSD2, or PTSD1 & PTSD2
+m %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+
+```
+
+
+
+
+### Age, group_by(NewGroup,Site)
+```{r}
+df <- df0
+df %>% group_by(NewGroup,Site) %>% get_summary_stats(Age, type = "mean_sd")
+df %>% ggplot(aes(x=Site, y=Age, fill=NewGroup)) + geom_boxplot() + xlab("Site") + ylab("Age (Years)")
+aov(Age ~ SITE * NewGroup, data = df) %>% summary()
+```
+
+### Current PTSD severity, group_by(NewGroup,Site)
+```{r}
+# dfx$CurrentPTSDSeverity <- dfx$Current.PTSD.severity %>% as.numeric()
+# dfx %>% group_by(NewGroup,SITE) %>% get_summary_stats(CurrentPTSDSeverity, type = "mean_sd")
+# dfx %>% ggplot(aes(x=SITE, y=CurrentPTSDSeverity, fill=NewGroup)) + geom_boxplot() + xlab("Site") + ylab("Current PTSD Severity")
+```
+
+
+### Recur, group_by(NewGroup,Recur)
+```{r}
+df <- df0[complete.cases(df0$Recur),] # remove rows with NaN
+df$Recur <- df$Recur %>% as.factor()
+df %>% group_by(NewGroup,Recur) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,Recur) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=Recur, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+res <- prop.test(x=c(28,38),n=c(28+68,38+68)) # two-proportions z-test
+res
+# prop.test(x=df$Recur, n=df$Group, p = NULL, alternative = "two.sided", correct = TRUE)
+```
+
+
+### AD, group_by(NewGroup,AD)
+```{r}
+df <- df0[complete.cases(df0$AD),] # remove rows with NaN
+df$AD <- df$AD %>% as.factor()
+df %>% group_by(NewGroup,AD) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,AD) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=AD, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+res <- prop.test(x=c(8,13),n=c(93+8,95+13)) # two-proportions z-test
+res
+```
+
+### Rem, group_by(NewGroup,Rem)
+```{r}
+df <- df0[complete.cases(df0$Rem),] # remove rows with NaN
+df$Rem <- df$Rem %>% as.factor()
+df %>% group_by(NewGroup,Rem) %>% summarise(n=n())
+df1 <- df %>% group_by(NewGroup,Rem) %>% summarise(n=n())
+df1 %>% ggplot(aes(fill=Rem, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+res <- prop.test(x=c(26,13),n=c(26+130,13+131)) # two-proportions z-test
+res
+```
+
+### AO, group_by(NewGroup)
+```{r}
+df <- df0[complete.cases(df0$AO),] # remove rows with NaN
+df1 <- df %>% group_by(NewGroup) %>% get_summary_stats(AO, type = "mean_sd")
+df %>% ggplot(aes(x=NewGroup, y=AO, fill=NewGroup)) + geom_violin() + xlab("NewGroup") + ylab("AO")
+```
+
+### Sev, group_by(NewGroup,Sev)
+```{r}
+df <- df0[complete.cases(df0$Sev),] # remove rows with NaN
+df$Sev <- df$Sev %>% as.factor()
+df1 <- df %>% group_by(NewGroup,Sev) %>% summarise(n=n())
+df1
+df1 %>% ggplot(aes(fill=Sev, y=n, x=NewGroup, label=n)) + geom_bar(position="stack", stat="identity") + ylab("Number of Participants") + geom_text(size=3, position=position_stack(vjust = 0.5))
+matrix(c(1,45,26,1,46,29),3,2) %>% chisq.test() # Pearson's Chi-squared Test for Count Data
+```
+
+
+```{r}
+#######################################################################
+# a function to model (lm or lmer) data for each ROI-to-ROI connection, and extract models/coefficients/p-values of models
+# Input
+# --- y, dataframe column, e.g. df$col01, or select(col1:col10)
+# --- df, dataframe
+# --- Otype, the type of outputs, e.g. "model", "coef", and "p"
+# --- ftxt, text for the formula, e.g. "lmer(formula = y ~ age_d + age_m + drinking_class + sex + race + ses + fh_alc_density + life_trauma_RP + (1|participant_id)"
+# --- fterms, which factor to be plotted
+# --- fxy, x and y labels
+# Output
+# --- model, list of models
+# --- coef,  matrix of coefficients
+# --- pval,  matrix of coefficients
+# --- plt,   list of plotting objects
+SDL_lm <- function(y,df,Otype,ftxt,fterms=NULL,fxy=NULL){
+  model <- eval(parse(text=paste(substr(ftxt,1,nchar(ftxt)-1),", data = df)")))
+  coef  <- model %>% summary() %>% coefficients() # Estimate, Std. Error, t value, Pr(>|t|)
+  tval  <- coef %>% .[,"t value"] 
+  pval  <- coef %>% .[,"Pr(>|t|)"]
+  #plt   <- model %>% plot_model(type = "pred", terms = fterms, title = "", axis.title = fxy)
+  switch(Otype,"model"=return(model),"coef"=return(list(coef)),"tval"=return(tval),"pval"=return(pval),"plt"=return(list(plt)))
+}
+##############################################################################
+```
+
+# Between-group comparisons
+
+## Raw group labels 
+```{r,echo=FALSE}
+NameGroupEffect <- 'GroupMDD'
+NameGroupAge    <- 'GroupPTSD:Age'
+NameGroupSex    <- 'GroupPTSD:SexFemale'
+
+df <- df0
+# patients vs. control
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0[NameGroupEffect,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupEffect,])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0[NameGroupAge,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupAge,])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup, shape=Site)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0[NameGroupSex,]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0[NameGroupSex,])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+# New groups: (PAT1 + Controls) 
+```{r,echo=FALSE}
+# PTSD1 vs. controls
+df <- df0 %>% filter(NewGroup!="PAT2") # only groups -1 & 1
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of PTSD2
+# df %>% SDL_mplt()
+
+# PTSD vs. control
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupPAT1',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT1',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupPAT1:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT1:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupPAT1:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT1:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LCEN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LCEN-to-Language FC")
+```
+
+
+
+## New groups: (PAT2 + Controls)
+```{r,echo=FALSE}
+# PAT2 vs. controls
+df <- df0 %>% filter(NewGroup!="PAT1") # only groups -1 & 2
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of PTSD1
+# df %>% SDL_mplt()
+
+# PAT vs. control
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupPAT2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupPAT2:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupPAT2:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+## New groups: (PAT1 + PAT2)
+```{r,echo=FALSE}
+# PAT1 vs. PAT2
+df <- df0 %>% filter(NewGroup!="Control") 
+df$Group <- df$NewGroup %>% as.character() %>% as.factor() # remove the level of Control
+# df %>% SDL_mplt()
+
+# PAT2 vs. PAT1
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupPAT2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# Effect of Group:Age
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Age + Sex)")
+x <- Tval0['GroupPAT2:Age',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2:Age',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Age in a sample connection
+y <- df[,"V42"]
+mod <- lm(formula = y ~ Group * Age + Sex, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Age","Group"), title = "dDMN-to-prim_Visual FC",axis.title=c("Age (Years)","rsFC")) # example plot of Group:Age effect
+
+# scatter plots rsFC~Group:Age
+df %>% ggplot(aes(x=Age, y=df[,"V42"], color=NewGroup)) + geom_point(size=2) + xlab("Age (Years)") + ylab("rsFC") + labs(title="dDMN-to-prim_Visual FC")
+
+
+# Effect of Group:Sex
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group * Sex + Age)")
+x <- Tval0['GroupPAT2:SexFemale',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group * Sex + Age)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPAT2:SexFemale',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+# plot the effects of Group:Sex in a sample connection
+y <- df[,"V56"]
+mod <- lm(formula = y ~ Group * Sex + Age, data=df)
+# mod %>% summary()
+mod %>% plot_model(type = "pred", terms = c("Group","Sex"), title = "LECN-to-Language FC",axis.title=c("NewGroup","rsFC")) # example plot of Group:Sex effect
+
+# scatter plots rsFC~Group:Sex
+df %>% ggboxplot(x="NewGroup", y="V56", color="Sex") + xlab("NewGroup") + ylab("rsFC") + labs(title="LECN-to-Language FC")
+```
+
+
+
+
+
+
+
+
+## New group4: (MDD1 + PTSD1)
+```{r,echo=FALSE}
+# MDD1 vs. MDD2
+df <- df0 %>% filter(NewGroup4=="MDD1" | NewGroup4=="PTSD1") 
+df$Group <- df$NewGroup4 %>% as.character() %>% as.factor() # remove the level of Control
+# df %>% SDL_mplt()
+
+# PAT2 vs. PAT1
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupPTSD1',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPTSD1',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+```
+
+## New group4: (MDD2 + PTSD2)
+```{r,echo=FALSE}
+# MDD2 vs. PTSD2
+df <- df0 %>% filter(NewGroup4=="MDD2" | NewGroup4=="PTSD2") 
+df$Group <- df$NewGroup4 %>% as.character() %>% as.factor() # remove the level of Control
+# df %>% SDL_mplt()
+
+# PTSD2 vs. MDD2
+Tval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="tval", ftxt="lm(formula = y ~ Group + Age + Sex)")
+x <- Tval0['GroupPTSD2',]
+SDL_mheat(x=x, title='T-value', fmidpoint=0, flimit=c(min(x),max(x)))
+
+Pval0 <- df %>% select(V1:V91) %>% sapply(SDL_lm, df=df, Otype="pval", ftxt="lm(formula = y ~ Group + Age + Sex)")  %>% t() %>% as.data.frame() %>% sapply(p.adjust,method="fdr") %>% t()
+x <- -1* log10(Pval0['GroupPTSD2',])
+SDL_mheat(x=x, title='-1*log10(P_FDR)', fmidpoint=-1*log10(0.05), flimit=c(min(x),max(x)))
+
+```
